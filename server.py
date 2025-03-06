@@ -1,70 +1,80 @@
 import socket
 import cv2
 import numpy as np
+import argparse
 from concurrent.futures import ThreadPoolExecutor
-import argparse  # Added for CLI parsing
+import time
 
-# Add argument parsing
-parser = argparse.ArgumentParser(description='4K Video Processing Server')
-parser.add_argument('--port', type=int, required=True,
-                    help='Port number to listen on')
+# Use TurboJPEG for faster encoding/decoding
+from turbojpeg import TurboJPEG
+jpeg = TurboJPEG()
+
+parser = argparse.ArgumentParser(description='Optimized 4K Video Server')
+parser.add_argument('--port', type=int, required=True)
 args = parser.parse_args()
 
 HOST = '0.0.0.0'
 PORT = args.port
-BUFFER_SIZE = 4 * 1024 * 1024  # 4MB buffer
+BUFFER_SIZE = 4 * 1024 * 1024
 MAX_WORKERS = 4
-FRAME_SIZE = (3840, 2160)  # 4K resolution
+FRAME_SIZE = (3840, 2160)
 
 def process_frame(frame_data):
-    # Decode with 4K parameters
-    frame = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_COLOR)
+    try:
+        # TurboJPEG decoding (5-10x faster than OpenCV)
+        frame = jpeg.decode(frame_data)
+        
+        # Accelerated grayscale conversion
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # TurboJPEG encoding
+        return jpeg.encode(gray, quality=95)
     
-    # Your processing (grayscale conversion)
-    processed = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
-    # Encode with high-quality parameters
-    _, encoded = cv2.imencode('.jpg', processed, [
-        cv2.IMWRITE_JPEG_QUALITY, 95,
-        cv2.IMWRITE_JPEG_SAMPLING_FACTOR, '4:4:4'
-    ])
-    return encoded.tobytes()
+    except Exception as e:
+        print(f"Processing error: {e}")
+        return b''
 
 def handle_client(conn):
-    with conn:
+    with conn, ThreadPoolExecutor(max_workers=2) as executor:
+        future = None
         while True:
             try:
-                # Receive frame size header
-                size_header = conn.recv(16)
+                # Async receive
+                size_header = conn.recv(4)
                 if not size_header: break
                 frame_size = int.from_bytes(size_header, 'big')
                 
-                # Receive frame data
-                frame_data = bytearray()
-                while len(frame_data) < frame_size:
-                    chunk = conn.recv(min(BUFFER_SIZE, frame_size - len(frame_data)))
-                    if not chunk: break
-                    frame_data.extend(chunk)
+                # Zero-copy buffer
+                frame_data = bytearray(frame_size)
+                view = memoryview(frame_data)
+                total = 0
+                while total < frame_size:
+                    recv_size = conn.recv_into(view[total:], frame_size - total)
+                    if recv_size == 0: break
+                    total += recv_size
                 
-                # Process in parallel
-                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    processed_data = executor.submit(process_frame, frame_data).result()
+                # Pipeline processing
+                if future is not None:
+                    processed_data = future.result()
+                    conn.sendall(len(processed_data).to_bytes(4, 'big') + processed_data)
                 
-                # Send processed frame
-                conn.sendall(len(processed_data).to_bytes(16, 'big'))
-                conn.sendall(processed_data)
-
+                # Submit next frame async
+                future = executor.submit(process_frame, frame_data)
+            
             except Exception as e:
-                print(f"Error: {e}")
+                print(f"Connection error: {e}")
                 break
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((HOST, PORT))
-    s.listen()
-    print(f"4K Server listening on {HOST}:{PORT}")
-    
-    while True:
-        conn, addr = s.accept()
-        print(f"New connection from {addr}")
-        ThreadPoolExecutor(max_workers=1).submit(handle_client, conn)
+if __name__ == '__main__':
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((HOST, PORT))
+        s.listen()
+        print(f"Optimized server listening on {HOST}:{PORT}")
+        
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            while True:
+                conn, addr = s.accept()
+                print(f"New connection: {addr}")
+                executor.submit(handle_client, conn)

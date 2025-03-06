@@ -13,69 +13,56 @@ HOST = '0.0.0.0'
 PORT = args.port
 BUFFER_SIZE = 4 * 1024 * 1024  # 4MB
 
-# Pre-allocate reusable buffers
-HEADER_SIZE = 4
-encode_params = [cv2.IMWRITE_JPEG_QUALITY, 85, cv2.IMWRITE_JPEG_OPTIMIZE, 1]
-
 def process_frame(frame_data):
-    # Fast decode with fixed buffer
+    # Fast decode with reduced checks
     frame = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_COLOR)
     if frame is None:
-        return None
+        return b''
     
-    # Optimized grayscale conversion
+    # Fast grayscale conversion
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     
-    # Faster encode with pre-defined params
-    success, encoded = cv2.imencode('.jpg', gray, encode_params)
-    return encoded.tobytes() if success else None
+    # Optimized encode with faster parameters
+    _, encoded = cv2.imencode('.jpg', gray, [
+        cv2.IMWRITE_JPEG_QUALITY, 90,  # Reduced for speed
+        cv2.IMWRITE_JPEG_OPTIMIZE, 1
+    ])
+    return encoded.tobytes()
 
 def handle_client(conn):
     try:
-        prev_time = time.time()
-        frame_count = 0
-        recv_buffer = bytearray()
-        send_buffer = bytearray()
-        
-        while True:
-            # Receive header
-            while len(recv_buffer) < HEADER_SIZE:
-                chunk = conn.recv(BUFFER_SIZE)
-                if not chunk: break
-                recv_buffer += chunk
+        with conn:
+            prev_time = time.time()
+            frame_count = 0
             
-            if len(recv_buffer) < HEADER_SIZE: break
-            frame_size = int.from_bytes(recv_buffer[:HEADER_SIZE], 'big')
-            recv_buffer = recv_buffer[HEADER_SIZE:]
-            
-            # Receive frame data
-            while len(recv_buffer) < frame_size:
-                chunk = conn.recv(BUFFER_SIZE)
-                if not chunk: break
-                recv_buffer += chunk
-            
-            if len(recv_buffer) < frame_size: break
-            
-            # Process and send
-            processed = process_frame(recv_buffer[:frame_size])
-            recv_buffer = recv_buffer[frame_size:]
-            
-            if processed:
-                # Prepare send buffer
-                send_buffer = len(processed).to_bytes(HEADER_SIZE, 'big') + processed
-                conn.sendall(send_buffer)
-            
-            # FPS counter
-            frame_count += 1
-            if frame_count % 30 == 0:
-                curr_time = time.time()
-                print(f"Server FPS: {30/(curr_time-prev_time):.2f}")
-                prev_time = curr_time
+            while True:
+                # Receive header (4 bytes)
+                size_header = conn.recv(4)
+                if len(size_header) != 4: break
+                frame_size = int.from_bytes(size_header, 'big')
+                
+                # Memoryview for zero-copy
+                frame_data = bytearray(frame_size)
+                view = memoryview(frame_data)
+                total = 0
+                while total < frame_size:
+                    recv_size = conn.recv_into(view[total:], frame_size - total)
+                    if recv_size == 0: break
+                    total += recv_size
+                
+                # Process and send in parallel
+                processed = process_frame(frame_data)
+                conn.sendall(len(processed).to_bytes(4, 'big') + processed)
+                
+                # Monitoring
+                frame_count += 1
+                if frame_count % 30 == 0:
+                    curr_time = time.time()
+                    print(f"Server FPS: {30/(curr_time-prev_time):.2f}")
+                    prev_time = curr_time
 
     except Exception as e:
         print(f"Client error: {e}")
-    finally:
-        conn.close()
 
 if __name__ == '__main__':
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -83,7 +70,7 @@ if __name__ == '__main__':
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((HOST, PORT))
         s.listen(5)
-        print(f"Server listening on {PORT}")
+        print(f"High-speed server listening on {PORT}")
         
         while True:
             conn, addr = s.accept()

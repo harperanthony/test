@@ -24,7 +24,7 @@ def process_frame(frame_data):
     
     # Optimized encode with faster parameters
     _, encoded = cv2.imencode('.jpg', gray, [
-        cv2.IMWRITE_JPEG_QUALITY, 90,  # Reduced for speed
+        cv2.IMWRITE_JPEG_QUALITY, 80,  # Reduced for speed
         cv2.IMWRITE_JPEG_OPTIMIZE, 1
     ])
     return encoded.tobytes()
